@@ -13,6 +13,7 @@ from sqlalchemy import (
 	Table,
 	Text,
 	create_engine,
+	select,
 	inspect,
 	text,
 	Integer,
@@ -51,6 +52,8 @@ def normalize_column_names(headers: Iterable[Any]) -> list[str]:
 			value = f'coluna_{index}'
 
 		value = re.sub(r'\W+', '_', value).strip('_').lower()
+		if not value:
+			value = f'coluna_{index}'
 
 		count = seen.get(value, 0)
 		seen[value] = count + 1
@@ -237,24 +240,123 @@ def create_engine_from_url(database_url: str):
 	return create_engine(database_url)
 
 
+def unique_column_name(base: str, used: set[str]) -> str:
+	name = base
+	index = 2
+	while name in used:
+		name = f'{base}_{index}'
+		index += 1
+	used.add(name)
+	return name
+
+
+def is_id_name(column_name: str) -> bool:
+	return column_name.strip().lower() == 'id'
+
+
+def remap_incoming_columns(columns: list[str]) -> list[str]:
+	"""Map incoming columns to DB-safe names, reserving `id` for technical PK."""
+	used = {'id'}
+	result: list[str] = []
+
+	for column in columns:
+		base = 'source_id' if is_id_name(column) else column
+		result.append(unique_column_name(base, used))
+
+	return result
+
+
+def make_temp_table_name(table_name: str, max_len: int = 60) -> str:
+	temp = f'__tmp_{table_name}_idpk'
+	if len(temp) <= max_len:
+		return temp
+
+	trim = max_len - len('__tmp__idpk')
+	trimmed = table_name[: max(trim, 1)]
+	return f'__tmp_{trimmed}_idpk'
+
+
+def rename_table(connection, dialect_name: str, from_name: str, to_name: str) -> None:
+	preparer = connection.dialect.identifier_preparer
+	quoted_from = preparer.quote(from_name)
+	quoted_to = preparer.quote(to_name)
+
+	if dialect_name == 'mysql':
+		connection.execute(text(f'RENAME TABLE {quoted_from} TO {quoted_to}'))
+		return
+
+	if dialect_name in {'mssql'}:
+		connection.execute(text(f"EXEC sp_rename '{from_name}', '{to_name}'"))
+		return
+
+	connection.execute(text(f'ALTER TABLE {quoted_from} RENAME TO {quoted_to}'))
+
+
+def table_has_id_primary_key(engine, table_name: str) -> bool:
+	inspector = inspect(engine)
+	pk = inspector.get_pk_constraint(table_name) or {}
+	pk_columns = {str(col).lower() for col in (pk.get('constrained_columns') or [])}
+	columns = {str(col['name']).lower() for col in inspector.get_columns(table_name)}
+	return 'id' in columns and pk_columns == {'id'}
+
+
+def rebuild_table_with_id_primary_key(engine, table_name: str) -> None:
+	"""Rebuild an existing table to ensure `id` is the only primary key."""
+	metadata = MetaData()
+	existing_table = Table(table_name, metadata, autoload_with=engine)
+
+	used_names = {'id'}
+	rename_map: dict[str, str] = {}
+	for column in existing_table.columns:
+		base = 'source_id' if is_id_name(column.name) else column.name
+		rename_map[column.name] = unique_column_name(base, used_names)
+
+	temp_table_name = make_temp_table_name(table_name)
+	temp_metadata = MetaData()
+	temp_columns = [Column('id', Integer(), primary_key=True, autoincrement=True)]
+
+	for column in existing_table.columns:
+		target_name = rename_map[column.name]
+		temp_columns.append(Column(target_name, column.type, nullable=column.nullable))
+
+	temp_table = Table(temp_table_name, temp_metadata, *temp_columns)
+
+	with engine.begin() as connection:
+		inspector = inspect(connection)
+		if temp_table_name in inspector.get_table_names():
+			Table(temp_table_name, MetaData(), autoload_with=connection).drop(connection)
+
+		temp_table.create(connection)
+
+		select_columns = [
+			existing_table.c[source_name].label(target_name)
+			for source_name, target_name in rename_map.items()
+		]
+
+		if select_columns:
+			insert_stmt = temp_table.insert().from_select(
+				[target for target in rename_map.values()],
+				select(*select_columns),
+			)
+			connection.execute(insert_stmt)
+
+		existing_table.drop(connection)
+		rename_table(connection, connection.dialect.name, temp_table_name, table_name)
+
+
 def ensure_table(
 	engine,
 	table_name: str,
 	columns: list[str],
 	column_types: dict[str, Any],
-	id_in_headers: bool = False,
 ) -> Table:
-	"""Ensure the table exists with given columns and types.
-
-	If `id_in_headers` is True, create an `id` primary key (auto-increment) and do not treat incoming `id` as a regular column.
-	"""
+	"""Ensure the table exists, has `id` PK, and includes incoming columns."""
 	inspector = inspect(engine)
 	metadata = MetaData()
 
 	if table_name not in inspector.get_table_names():
 		table_columns = []
-		if id_in_headers:
-			table_columns.append(Column('id', Integer(), primary_key=True, autoincrement=True))
+		table_columns.append(Column('id', Integer(), primary_key=True, autoincrement=True))
 
 		for column in columns:
 			sa_type = column_types.get(column, Text())
@@ -264,56 +366,22 @@ def ensure_table(
 		metadata.create_all(engine, tables=[table], checkfirst=True)
 		return table
 
+	if not table_has_id_primary_key(engine, table_name):
+		rebuild_table_with_id_primary_key(engine, table_name)
+
+	inspector = inspect(engine)
 	existing_info = inspector.get_columns(table_name)
 	existing_columns = {col['name'] for col in existing_info}
+	existing_columns_lower = {str(name).lower() for name in existing_columns}
 
 	preparer = engine.dialect.identifier_preparer
 	quoted_table = preparer.quote(table_name)
 
 	with engine.begin() as connection:
-		# If incoming had `id`, ensure a proper integer PK exists instead of a text `id` column
-		if id_in_headers:
-			quoted_id = preparer.quote('id')
-			# If an `id` column exists, drop it first (user requested to "retire")
-			if 'id' in existing_columns:
-				try:
-					connection.execute(text(f'ALTER TABLE {quoted_table} DROP COLUMN {quoted_id}'))
-				except Exception as exc:  # pragma: no cover - DB-specific behavior
-					print(f'Aviso: não foi possível remover coluna `id` existente: {exc}')
-				existing_columns.discard('id')
-
-			# Add id PK depending on dialect
-			dialect = engine.dialect.name
-			try:
-				if dialect == 'mysql':
-					connection.execute(
-						text(
-							f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_id} INT NOT NULL AUTO_INCREMENT PRIMARY KEY'
-						)
-					)
-				elif dialect in ('postgresql', 'postgres'):
-					connection.execute(
-						text(
-							f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_id} SERIAL PRIMARY KEY'
-						)
-					)
-				elif dialect == 'sqlite':
-					# SQLite cannot alter PKs easily; add an integer column (not PK) as fallback
-					connection.execute(
-						text(f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_id} INTEGER')
-					)
-					print(
-						'Aviso: SQLite não suporta adicionar PRIMARY KEY em tabela existente; coluna `id` adicionada sem PK.'
-					)
-				else:
-					connection.execute(
-						text(f'ALTER TABLE {quoted_table} ADD COLUMN {quoted_id} INT')
-					)
-			except Exception as exc:  # pragma: no cover - DB-specific behavior
-				print(f'Aviso: não foi possível criar coluna `id` como PK: {exc}')
-
 		# Add any missing non-id columns with inferred types
-		missing_columns = [column for column in columns if column not in existing_columns]
+		missing_columns = [
+			column for column in columns if column.lower() not in existing_columns_lower
+		]
 
 		# For existing columns, optionally adjust types on MySQL when inferred type
 		# is Text but the DB column is a date/time type (common after previous bad
@@ -321,10 +389,13 @@ def ensure_table(
 		dialect = engine.dialect.name
 		if dialect == 'mysql':
 			for column in columns:
-				if column not in existing_columns:
+				if column.lower() not in existing_columns_lower:
 					continue
 				# find the existing column info
-				existing_col = next((c for c in existing_info if c['name'] == column), None)
+				existing_col = next(
+					(c for c in existing_info if str(c['name']).lower() == column.lower()),
+					None,
+				)
 				if not existing_col:
 					continue
 				sa_type = column_types.get(column, Text())
@@ -388,40 +459,33 @@ def import_workbook(engine, file_path: Path) -> int:
 			return 0
 
 		# normalize headers (lowercase)
-		columns_all = normalize_column_names(headers_row)
+		normalized_headers = normalize_column_names(headers_row)
+		columns = remap_incoming_columns(normalized_headers)
 
 		# read rows into memory (sample + payload)
 		all_rows = list(rows_iter)
 
 		# infer types using a sample of rows
-		column_types = infer_column_types(columns_all, all_rows)
-
-		# handle `id` header: remove it from incoming columns and data, but create PK in table
-		id_index = None
-		if 'id' in columns_all:
-			id_index = columns_all.index('id')
-
-		keep_indices = [i for i in range(len(columns_all)) if i != id_index]
-		columns = [columns_all[i] for i in keep_indices]
-
-		# filter column_types to kept columns
-		filtered_column_types = {k: v for k, v in column_types.items() if k != 'id'}
+		projected_rows = [
+			tuple(row[idx] if idx < len(row) else None for idx in range(len(columns)))
+			for row in all_rows
+		]
+		filtered_column_types = infer_column_types(columns, projected_rows)
 
 		table = ensure_table(
 			engine,
 			normalize_table_name(file_path),
 			columns,
 			filtered_column_types,
-			id_in_headers=(id_index is not None),
 		)
 
 		payload = []
-		for row in all_rows:
+		for row in projected_rows:
 			if not any(value is not None and value != '' for value in row):
 				continue
 
 			row_dict: dict[str, Any] = {}
-			for idx, col in zip(keep_indices, columns):
+			for idx, col in enumerate(columns):
 				value = row[idx] if idx < len(row) else None
 				sa_type = filtered_column_types.get(col, Text())
 				row_dict[col] = cast_value_to_type(value, sa_type)

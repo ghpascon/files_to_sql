@@ -47,5 +47,7 @@ poetry run python main.py --database-url "sqlite:///files_to_sql.db" --tables-di
 - Cada arquivo `.xlsx` vira uma tabela com o nome do arquivo em minúsculas
 - Exemplo: `BASEINV.xlsx` gera a tabela `baseinv`
 - A primeira linha da planilha vira o cabeçalho das colunas
+- Toda tabela possui a coluna `id` como chave primária auto incremento
+- Se a planilha já tiver uma coluna `ID`/`id`, ela é importada como `source_id`
 - Os dados são inseridos sem apagar a tabela existente
 - Se a tabela já existir e faltarem colunas novas da planilha, elas são adicionadas
