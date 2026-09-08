@@ -138,11 +138,15 @@ def infer_single_column_type(values: list[Any]):
 
 			encountered_str = True
 
-	if encountered_datetime:
+	# Prefer concrete date/time types only when there are no non-date/time strings
+	# in the sample. If the column contains a mix of date/time objects and
+	# arbitrary strings (common with Excel import), default to Text to avoid
+	# binding errors (e.g. MySQL rejecting non-time strings for TIME columns).
+	if encountered_datetime and not encountered_str:
 		return SA_DateTime()
-	if encountered_date:
+	if encountered_date and not encountered_str:
 		return SA_Date()
-	if encountered_time:
+	if encountered_time and not encountered_str:
 		return SA_Time()
 	if encountered_bool and not (encountered_int or encountered_float or encountered_str):
 		return Boolean()
@@ -310,6 +314,46 @@ def ensure_table(
 
 		# Add any missing non-id columns with inferred types
 		missing_columns = [column for column in columns if column not in existing_columns]
+
+		# For existing columns, optionally adjust types on MySQL when inferred type
+		# is Text but the DB column is a date/time type (common after previous bad
+		# inference). This avoids inserting non-time strings into TIME columns.
+		dialect = engine.dialect.name
+		if dialect == 'mysql':
+			for column in columns:
+				if column not in existing_columns:
+					continue
+				# find the existing column info
+				existing_col = next((c for c in existing_info if c['name'] == column), None)
+				if not existing_col:
+					continue
+				sa_type = column_types.get(column, Text())
+				try:
+					existing_type = existing_col.get('type')
+					# compile SQL type names for comparison (fallback to str)
+					existing_type_sql = (
+						existing_type.compile(engine.dialect)
+						if hasattr(existing_type, 'compile')
+						else str(existing_type)
+					)
+					type_sql = sa_type.compile(engine.dialect)
+				except Exception:
+					existing_type_sql = str(existing_type)
+					type_sql = str(sa_type)
+				# if inferred is Text but DB has a time/date type, try to modify to TEXT
+				if (
+					isinstance(sa_type, Text)
+					and existing_type_sql
+					and any(kw in existing_type_sql.lower() for kw in ('time', 'date'))
+				):
+					quoted_column = preparer.quote(column)
+					try:
+						connection.execute(
+							text(f'ALTER TABLE {quoted_table} MODIFY COLUMN {quoted_column} TEXT')
+						)
+					except Exception as exc:  # pragma: no cover - DB-specific behavior
+						print(f'Aviso: falha ao alterar tipo da coluna {column}: {exc}')
+
 		for column in missing_columns:
 			quoted_column = preparer.quote(column)
 			sa_type = column_types.get(column, Text())
